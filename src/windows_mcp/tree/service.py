@@ -250,6 +250,57 @@ class Tree:
             )
         return BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0)
 
+    @staticmethod
+    def _identity_metadata(node: Control) -> dict[str, Any]:
+        """Read cached UIA identity fields used to relocate a captured element."""
+        metadata: dict[str, Any] = {}
+        try:
+            automation_id = node.CachedAutomationId
+            if isinstance(automation_id, str) and automation_id:
+                metadata["automation_id"] = automation_id
+        except Exception:
+            pass
+        try:
+            runtime_id = node.GetCachedPropertyValue(PropertyId.RuntimeIdProperty)
+            if isinstance(runtime_id, (list, tuple)) and runtime_id and all(
+                isinstance(item, int) and not isinstance(item, bool) for item in runtime_id
+            ):
+                metadata["runtime_id"] = list(runtime_id)
+        except Exception:
+            pass
+        for key, property_id in (
+            ("native_window_handle", PropertyId.NativeWindowHandleProperty),
+            ("process_id", PropertyId.ProcessIdProperty),
+            ("control_type_id", PropertyId.ControlTypeProperty),
+        ):
+            try:
+                value = node.GetCachedPropertyValue(property_id)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    metadata[key] = value
+            except Exception:
+                pass
+        for key, attribute in (
+            ("framework_id", "CachedFrameworkId"),
+            ("class_name", "CachedClassName"),
+        ):
+            try:
+                value = getattr(node, attribute)
+                if isinstance(value, str) and value:
+                    metadata[key] = value
+            except Exception:
+                pass
+        for key, attribute in (
+            ("is_enabled", "CachedIsEnabled"),
+            ("is_offscreen", "CachedIsOffscreen"),
+        ):
+            try:
+                value = getattr(node, attribute)
+                if type(value) in (bool, int) and value in (0, 1):
+                    metadata[key] = bool(value)
+            except Exception:
+                pass
+        return metadata
+
     def _append_word_nodes(self, word_elements:list[tuple[str,Rect]], reference_box:Rect, window_name:str,
                             target_nodes:list[TreeElementNode], current_semantic_node:'Optional[SemanticNode]'=None):
         """Append one interactive `TreeElementNode` (control_type='Word') per (word, rect) pair."""
@@ -405,7 +456,7 @@ class Tree:
                             name = node.CachedName
                             automation_id = node.CachedAutomationId
                             localized_control_type = node.CachedLocalizedControlType
-                            metadata:dict[str,Any]={}
+                            metadata = self._identity_metadata(node)
                             metadata['has_focused']=node.CachedHasKeyboardFocus
                             metadata['horizontal_scrollable']=scroll_pattern.HorizontallyScrollable
                             metadata['horizontal_scroll_percent']=round(scroll_pattern.HorizontalScrollPercent,2) if scroll_pattern.HorizontallyScrollable else 0
@@ -517,7 +568,7 @@ class Tree:
 
                                 if is_role_interactive and (is_default_action or is_keyboard_focusable):
                                     is_interactive = True
-                                
+
                         if isinstance(node,DocumentControl):
                             is_interactive=True
 
@@ -527,7 +578,7 @@ class Tree:
                             localized_control_type = node.CachedLocalizedControlType
                             accelerator_key = node.CachedAcceleratorKey
 
-                            metadata:dict[str,Any]={}
+                            metadata = self._identity_metadata(node)
                             metadata['has_focused']=is_focused
                             if accelerator_key:
                                 metadata['shortcut']=accelerator_key
@@ -606,7 +657,7 @@ class Tree:
                                     metadata['value']=value.strip() if value else '(empty)'
                                 except Exception:
                                     pass
-                                
+
                                 try:
                                     control_state=node.GetCachedPropertyValue(PropertyId.ExpandCollapseExpandCollapseStateProperty)
                                     match control_state:
@@ -848,6 +899,10 @@ class Tree:
             children_cache_req.TreeScope = TreeScope.TreeScope_Element | TreeScope.TreeScope_Children
 
             window_bounding_box=node.BoundingRectangle
+            try:
+                window_process_id = node.ProcessId
+            except Exception:
+                window_process_id = None
 
             interactive_nodes, dom_interactive_nodes, dom_informative_nodes, scrollable_nodes = [], [], [], []
             window_name=node.Name.strip()
@@ -915,6 +970,11 @@ class Tree:
                         )
                 except Exception as e:
                     logger.warning("IA2 fallback failed for '%s' (handle %#x): %s", window_name, handle, e)
+
+            for element in interactive_nodes + dom_interactive_nodes + scrollable_nodes:
+                element.metadata["window_handle"] = handle
+                if type(window_process_id) is int and window_process_id > 0:
+                    element.metadata["window_process_id"] = window_process_id
 
             logger.debug(f'Window name:{window_name}')
             logger.debug(f'Interactive nodes:{len(interactive_nodes)}')

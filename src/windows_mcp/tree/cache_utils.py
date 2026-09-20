@@ -67,6 +67,8 @@ class CacheRequestFactory:
         # These are batched into the existing BuildUpdatedCache round-trip, so they
         # are effectively free — measured cost is below run-to-run noise.
         cache_request.AddProperty(PropertyId.RuntimeIdProperty)
+        cache_request.AddProperty(PropertyId.NativeWindowHandleProperty)
+        cache_request.AddProperty(PropertyId.ProcessIdProperty)
         cache_request.AddProperty(PropertyId.IsContentElementProperty)
         cache_request.AddProperty(PropertyId.FrameworkIdProperty)
         cache_request.AddProperty(PropertyId.ClickablePointProperty)

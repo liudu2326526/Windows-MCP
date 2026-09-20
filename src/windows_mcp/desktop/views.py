@@ -45,6 +45,17 @@ class Window:
         ]
 
 
+@dataclass(frozen=True)
+class ForegroundWindowIdentity:
+    """Current Win32 foreground window and its top-level UIA window identity."""
+
+    raw_handle: int
+    root_handle: int
+    process_id: int
+    title: str
+    process_name: str | None
+
+
 @dataclass
 class Size:
     width: int
@@ -78,6 +89,10 @@ class DesktopState:
     screenshot_backend: str | None = None
     tree_state: TreeState | None = None
     capture_sec: float = 0.0
+    snapshot_id: str | None = None
+    foreground_handle: int | None = None
+    foreground_root_handle: int | None = None
+    foreground_process_id: int | None = None
 
     def active_desktop_to_string(self):
         desktop_name = self.active_desktop.get("name")

@@ -6,7 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from windows_mcp.desktop.views import DesktopState, Status, Window
-from windows_mcp.tools.input import register
+from windows_mcp.tools.input import _matches_wait_condition, register
 from windows_mcp.tree.views import BoundingBox, Center, TextElementNode, TreeElementNode, TreeState
 
 
@@ -58,14 +58,18 @@ def _element(
     *,
     window_name: str = "Notepad",
     focused: bool = False,
+    enabled: bool | None = None,
 ) -> TreeElementNode:
+    metadata: dict[str, bool] = {"has_focused": focused}
+    if enabled is not None:
+        metadata["is_enabled"] = enabled
     return TreeElementNode(
         name=name,
         control_type="Button",
         window_name=window_name,
         bounding_box=_box(),
         center=Center(x=50, y=20),
-        metadata={"has_focused": focused},
+        metadata=metadata,
     )
 
 
@@ -162,7 +166,9 @@ def test_wait_for_focused_element_matches_text_and_window() -> None:
 
 
 def test_wait_for_element_enabled_alias_matches_interactive_node() -> None:
-    desktop = FakeDesktop([_state(elements=[_element("Submit", window_name="Checkout")])])
+    desktop = FakeDesktop(
+        [_state(elements=[_element("Submit", window_name="Checkout", enabled=True)])]
+    )
     tools = _register_tools(desktop)
 
     result = asyncio.run(
@@ -176,6 +182,59 @@ def test_wait_for_element_enabled_alias_matches_interactive_node() -> None:
     )
 
     assert "condition 'element_enabled' satisfied" in result
+
+
+def test_wait_for_element_enabled_polls_until_metadata_is_true() -> None:
+    desktop = FakeDesktop(
+        [
+            _state(elements=[_element("Submit", enabled=False)]),
+            _state(elements=[_element("Submit", enabled=True)]),
+        ]
+    )
+    tools = _register_tools(desktop)
+
+    result = asyncio.run(
+        tools["WaitFor"](
+            condition="element_enabled",
+            text="submit",
+            timeout=1,
+            interval=0.001,
+        )
+    )
+
+    assert "condition 'element_enabled' satisfied" in result
+    assert len(desktop.calls) == 2
+
+
+@pytest.mark.parametrize("enabled", [None, False])
+def test_element_enabled_requires_explicit_true_metadata(enabled: bool | None) -> None:
+    state = _state(elements=[_element("Submit", enabled=enabled)])
+
+    matched, _ = _matches_wait_condition(state, "element_enabled", "submit", None)
+    exists, _ = _matches_wait_condition(state, "element_exists", "submit", None)
+
+    assert matched is False
+    assert exists is True
+
+
+@pytest.mark.parametrize("enabled", [None, False])
+def test_wait_for_element_enabled_times_out_without_true_metadata(
+    enabled: bool | None,
+) -> None:
+    desktop = FakeDesktop([_state(elements=[_element("Submit", enabled=enabled)])])
+    tools = _register_tools(desktop)
+
+    with pytest.raises(TimeoutError, match="matching element was absent"):
+        asyncio.run(
+            tools["WaitFor"](
+                condition="element_enabled",
+                text="submit",
+                timeout=0.01,
+                interval=0.001,
+            )
+        )
+
+    assert len(desktop.calls) > 1
 
 
 def test_wait_for_text_requires_text() -> None:

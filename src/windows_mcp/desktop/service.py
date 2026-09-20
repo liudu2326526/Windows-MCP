@@ -8,7 +8,15 @@ from windows_mcp.vdm.core import (
     get_current_desktop,
     is_window_on_current_desktop,
 )
-from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
+from windows_mcp.desktop.views import (
+    Browser,
+    DesktopState,
+    Display,
+    ForegroundWindowIdentity,
+    Size,
+    Status,
+    Window,
+)
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
 from PIL import ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
@@ -18,6 +26,8 @@ from windows_mcp.infrastructure import validate_url
 from urllib.parse import urljoin
 from locale import getpreferredencoding
 from typing import Literal
+from collections import OrderedDict
+from functools import wraps
 from markdownify import markdownify
 from fuzzywuzzy import process
 from time import sleep, time, perf_counter
@@ -34,6 +44,8 @@ import csv
 import re
 import os
 import io
+import threading
+import uuid
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -75,13 +87,213 @@ def _escape_text_for_sendkeys(text: str) -> str:
     return "".join(result)
 
 
+def _serialized_gui_call(method):
+    """Serialize methods that can observe or change the foreground desktop."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._get_interaction_lock():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Desktop:
+    _SNAPSHOT_HISTORY_LIMIT = 8
+
     def __init__(self):
         self.encoding = getpreferredencoding()
         self.tree = Tree(self)
         self.desktop_state = None
+        self._state_generation = 0
+        self._interaction_lock = threading.RLock()
+        self._snapshot_instance_id = uuid.uuid4().hex[:12]
+        self._snapshots: OrderedDict[str, DesktopState] = OrderedDict()
+        self._snapshot_pins: dict[str, int] = {}
+
+    @property
+    def interaction_lock(self) -> threading.RLock:
+        """Serialize foreground desktop observations and input actions."""
+        return self._get_interaction_lock()
+
+    def _get_interaction_lock(self) -> threading.RLock:
+        """Return the GUI lock, including for lightweight test doubles."""
+        lock = getattr(self, "_interaction_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._interaction_lock = lock
+        return lock
+
+    def _get_snapshot_store(self) -> OrderedDict[str, DesktopState]:
+        """Return the bounded snapshot store, including for lightweight test doubles."""
+        store = getattr(self, "_snapshots", None)
+        if store is None:
+            store = OrderedDict()
+            self._snapshots = store
+        return store
+
+    def _next_snapshot_id(self) -> str:
+        instance_id = getattr(self, "_snapshot_instance_id", None)
+        if instance_id is None:
+            instance_id = uuid.uuid4().hex[:12]
+            self._snapshot_instance_id = instance_id
+        self._state_generation = getattr(self, "_state_generation", 0) + 1
+        return f"snap-{instance_id}-{self._state_generation}"
+
+    def _remember_snapshot(self, state: DesktopState) -> None:
+        if state.snapshot_id is None:
+            return
+        store = self._get_snapshot_store()
+        store[state.snapshot_id] = state
+        store.move_to_end(state.snapshot_id)
+        self._prune_snapshots()
+
+    def _prune_snapshots(self) -> None:
+        store = self._get_snapshot_store()
+        pins = getattr(self, "_snapshot_pins", {})
+        unpinned = [snapshot_id for snapshot_id in store if not pins.get(snapshot_id)]
+        for snapshot_id in unpinned[: -self._SNAPSHOT_HISTORY_LIMIT]:
+            del store[snapshot_id]
+
+    def pin_snapshot(self, snapshot_id: str) -> None:
+        """Keep an actionable source snapshot alive during a bounded batch."""
+        with self._get_interaction_lock():
+            state = self.require_snapshot(snapshot_id)
+            if not hasattr(self, "_snapshot_pins"):
+                self._snapshot_pins = {}
+            self._snapshot_pins[snapshot_id] = self._snapshot_pins.get(snapshot_id, 0) + 1
+            self._get_snapshot_store()[snapshot_id] = state
+
+    def unpin_snapshot(self, snapshot_id: str) -> None:
+        """Release a batch's source snapshot and restore the ordinary history limit."""
+        with self._get_interaction_lock():
+            pins = getattr(self, "_snapshot_pins", {})
+            count = pins.get(snapshot_id, 0)
+            if count > 1:
+                pins[snapshot_id] = count - 1
+            else:
+                pins.pop(snapshot_id, None)
+            self._prune_snapshots()
+
+    release_snapshot = unpin_snapshot
+
+    @staticmethod
+    def _state_nodes(state: DesktopState) -> list[TreeElementNode]:
+        tree_state = state.tree_state
+        if tree_state is None:
+            return []
+        return list(tree_state.interactive_nodes) + list(tree_state.scrollable_nodes)
+
+    def get_foreground_identity(self) -> tuple[int, int]:
+        """Return the current raw foreground HWND and owning process ID."""
+        handle = win32gui.GetForegroundWindow()
+        if type(handle) is not int or handle <= 0 or not win32gui.IsWindow(handle):
+            raise ValueError("STALE_STATE: Windows has no valid foreground window")
+        _, process_id = win32process.GetWindowThreadProcessId(handle)
+        if type(process_id) is not int or process_id <= 0:
+            raise ValueError("STALE_STATE: foreground window has no owning process")
+        return handle, process_id
+
+    def get_foreground_window_identity(self) -> ForegroundWindowIdentity:
+        """Return live raw, UIA-root, process, and title identity for the foreground window."""
+        raw_before = self.get_foreground_identity()
+        root = self.get_window_from_element_handle(raw_before[0])
+        root_handle = root.NativeWindowHandle
+        root_process_id = root.ProcessId
+        title = root.Name
+        raw_after = self.get_foreground_identity()
+        if raw_after != raw_before:
+            raise ValueError("STALE_STATE: foreground window changed while reading its UIA root")
+        if type(root_handle) is not int or root_handle <= 0 or not win32gui.IsWindow(root_handle):
+            raise ValueError("STALE_STATE: foreground UIA root has no valid window")
+        if type(root_process_id) is not int or root_process_id != raw_before[1]:
+            raise ValueError("STALE_STATE: foreground UIA root belongs to another process")
+        try:
+            process_name = Process(root_process_id).name()
+        except Exception:
+            process_name = None
+        if self.get_foreground_identity() != raw_before:
+            raise ValueError("STALE_STATE: foreground window changed while reading process identity")
+        return ForegroundWindowIdentity(
+            raw_handle=raw_before[0],
+            root_handle=root_handle,
+            process_id=root_process_id,
+            title=title if isinstance(title, str) else "",
+            process_name=process_name,
+        )
+
+    def _capture_foreground_identity(self) -> tuple[int, int] | None:
+        """Allow observation during focus transitions without granting input authority."""
+        try:
+            return self.get_foreground_identity()
+        except Exception:
+            # Win32 can lose the foreground HWND between either identity query.
+            return None
+
+    def _capture_foreground_window_identity(self) -> ForegroundWindowIdentity | None:
+        """Observe a complete foreground identity without making a Snapshot actionable."""
+        try:
+            return self.get_foreground_window_identity()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _stable_snapshot_identity(
+        observations: list[ForegroundWindowIdentity | None],
+        *,
+        uia_root_handle: int | None,
+        uia_root_process_id: int | None,
+        require_uia_root: bool = False,
+    ) -> ForegroundWindowIdentity | None:
+        """Accept an identity only when every checkpoint and the captured UIA root agree."""
+        if not observations or any(identity is None for identity in observations):
+            return None
+        if require_uia_root and (uia_root_handle is None or uia_root_process_id is None):
+            return None
+        first = observations[0]
+        assert first is not None
+        identity_key = (first.raw_handle, first.root_handle, first.process_id)
+        if any(
+            (identity.raw_handle, identity.root_handle, identity.process_id) != identity_key
+            for identity in observations[1:]
+            if identity is not None
+        ):
+            return None
+        if uia_root_handle is not None and uia_root_handle != first.root_handle:
+            return None
+        if uia_root_process_id is not None and uia_root_process_id != first.process_id:
+            return None
+        return first
 
     def get_state(
+        self,
+        use_annotation: bool | str = True,
+        use_vision: bool | str = False,
+        use_dom: bool | str = False,
+        use_ui_tree: bool | str = True,
+        as_bytes: bool | str = False,
+        scale: float = 1.0,
+        grid_lines: tuple[int, int] | None = None,
+        display_indices: list[int] | None = None,
+        region: list[int] | tuple[int, ...] | None = None,
+        max_image_size: Size | None = None,
+    ) -> DesktopState:
+        """Capture a desktop state while serializing foreground GUI access."""
+        with self._get_interaction_lock():
+            return self._get_state_unlocked(
+                use_annotation=use_annotation,
+                use_vision=use_vision,
+                use_dom=use_dom,
+                use_ui_tree=use_ui_tree,
+                as_bytes=as_bytes,
+                scale=scale,
+                grid_lines=grid_lines,
+                display_indices=display_indices,
+                region=region,
+                max_image_size=max_image_size,
+            )
+
+    def _get_state_unlocked(
         self,
         use_annotation: bool | str = True,
         use_vision: bool | str = False,
@@ -108,6 +320,13 @@ class Desktop:
 
         if use_dom and not use_ui_tree:
             raise ValueError("use_dom=True requires use_ui_tree=True")
+
+        foreground_observations: list[ForegroundWindowIdentity | None] = []
+        foreground_raw_before: tuple[int, int] | None = None
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
+        else:
+            foreground_raw_before = self._capture_foreground_identity()
 
         start_time = time()
         profile_enabled = _snapshot_profile_enabled()
@@ -145,6 +364,9 @@ class Desktop:
             windows_handles = set()
             active_window = None
             active_window_handle = None
+
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
 
         cursor_position = self.get_cursor_location()
 
@@ -188,6 +410,10 @@ class Desktop:
             tree_state = self.tree.get_state(
                 tree_active_window_handle, list(other_windows_handles), use_dom=use_dom
             )
+            captured_uia_root_handle = tree_active_window_handle
+            captured_uia_root_process_id = (
+                active_window.process_id if tree_active_window_handle and active_window else None
+            )
         else:
             root_box = screenshot_region or self.tree.screen_box
             tree_state = TreeState(
@@ -201,6 +427,11 @@ class Desktop:
                     metadata={},
                 ),
             )
+            captured_uia_root_handle = None
+            captured_uia_root_process_id = None
+
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
 
         if profile_enabled:
             tree_capture_ms = (perf_counter() - stage_started_at) * 1000
@@ -270,6 +501,21 @@ class Desktop:
         else:
             screenshot = None
 
+        foreground = None
+        foreground_raw = None
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
+            foreground = self._stable_snapshot_identity(
+                foreground_observations,
+                uia_root_handle=captured_uia_root_handle,
+                uia_root_process_id=captured_uia_root_process_id,
+                require_uia_root=True,
+            )
+        else:
+            foreground_raw_after = self._capture_foreground_identity()
+            if foreground_raw_after == foreground_raw_before:
+                foreground_raw = foreground_raw_after
+
         self.desktop_state = DesktopState(
             active_window=active_window,
             windows=windows,
@@ -287,7 +533,20 @@ class Desktop:
             if use_vision
             else None,
             capture_sec=time() - start_time,
+            snapshot_id=self._next_snapshot_id(),
+            foreground_handle=(
+                foreground.raw_handle
+                if foreground
+                else (foreground_raw[0] if foreground_raw else None)
+            ),
+            foreground_root_handle=foreground.root_handle if foreground else None,
+            foreground_process_id=(
+                foreground.process_id
+                if foreground
+                else (foreground_raw[1] if foreground_raw else None)
+            ),
         )
+        self._remember_snapshot(self.desktop_state)
         if profile_enabled:
             state_build_ms = (perf_counter() - stage_started_at) * 1000
             total_profile_ms = (perf_counter() - profile_started_at) * 1000
@@ -323,6 +582,169 @@ class Desktop:
 
     def get_cursor_location(self) -> tuple[int, int]:
         return uia.GetCursorPos()
+
+    def require_snapshot(self, snapshot_id: str) -> DesktopState:
+        """Return a snapshot only while its raw foreground window is still active."""
+        with self._get_interaction_lock():
+            state = self._get_snapshot_store().get(snapshot_id)
+            if state is None and getattr(self, "desktop_state", None) is not None:
+                if self.desktop_state.snapshot_id == snapshot_id:
+                    state = self.desktop_state
+            if state is None:
+                raise ValueError(
+                    f"STALE_STATE: snapshot {snapshot_id!r} is unknown or expired; "
+                    "capture a fresh Snapshot"
+                )
+            if not state.foreground_handle or not state.foreground_process_id:
+                raise ValueError("STALE_STATE: Snapshot has no stable foreground identity")
+            try:
+                if state.foreground_root_handle:
+                    current = self.get_foreground_window_identity()
+                    current_handle = current.raw_handle
+                    current_root_handle = current.root_handle
+                    current_process_id = current.process_id
+                else:
+                    current_handle, current_process_id = self.get_foreground_identity()
+                    current_root_handle = None
+            except Exception as exc:
+                raise ValueError("STALE_STATE: foreground identity is unavailable") from exc
+            if (
+                state.foreground_handle != current_handle
+                or state.foreground_root_handle != current_root_handle
+                or state.foreground_process_id != current_process_id
+            ):
+                raise ValueError(
+                    "STALE_STATE: foreground window changed after the referenced Snapshot"
+                )
+            return state
+
+    @staticmethod
+    def _same_node_identity(source: TreeElementNode, candidate: TreeElementNode) -> bool:
+        source_meta = source.metadata
+        candidate_meta = candidate.metadata
+        if candidate_meta.get("is_enabled") is False or candidate_meta.get("is_offscreen") is True:
+            return False
+        for key in (
+            "window_handle",
+            "window_process_id",
+            "process_id",
+            "control_type_id",
+            "framework_id",
+            "class_name",
+        ):
+            if key in source_meta and candidate_meta.get(key) != source_meta[key]:
+                return False
+        runtime_id = source_meta.get("runtime_id")
+        if runtime_id:
+            return candidate_meta.get("runtime_id") == runtime_id
+        automation_id = source_meta.get("automation_id")
+        if automation_id:
+            return candidate_meta.get("automation_id") == automation_id
+        return (
+            candidate.bounding_box == source.bounding_box
+            and candidate.name.casefold() == source.name.casefold()
+            and candidate.control_type.casefold() == source.control_type.casefold()
+            and candidate.window_name.casefold() == source.window_name.casefold()
+        )
+
+    @staticmethod
+    def _matches_target_fields(
+        node: TreeElementNode,
+        *,
+        name: str | None,
+        window_name: str | None,
+        control_type: str | None,
+    ) -> bool:
+        return (
+            (name is None or node.name.casefold() == name.casefold())
+            and (
+                window_name is None
+                or node.window_name.casefold() == window_name.casefold()
+            )
+            and (
+                control_type is None
+                or node.control_type.casefold() == control_type.casefold()
+            )
+        )
+
+    def resolve_snapshot_target(
+        self,
+        snapshot_id: str,
+        *,
+        label: int | None = None,
+        name: str | None = None,
+        window_name: str | None = None,
+        control_type: str | None = None,
+    ) -> tuple[int, int]:
+        """Relocate a captured target in a fresh UIA tree under the same foreground window."""
+        with self._get_interaction_lock():
+            captured = self.require_snapshot(snapshot_id)
+            captured_nodes = self._state_nodes(captured)
+            source = None
+            if label is not None:
+                if type(label) is not int or label < 0 or label >= len(captured_nodes):
+                    raise ValueError("TARGET_NOT_FOUND: label is outside the referenced Snapshot")
+                source = captured_nodes[label]
+                if not self._matches_target_fields(
+                    source,
+                    name=name,
+                    window_name=window_name,
+                    control_type=control_type,
+                ):
+                    raise ValueError("STALE_STATE: target description does not match the Snapshot")
+            elif name is None:
+                raise ValueError("TARGET_NOT_FOUND: label or name is required")
+            else:
+                target_window_handle = (
+                    captured.active_window.handle
+                    if captured.active_window is not None
+                    else captured.foreground_root_handle or captured.foreground_handle
+                )
+                sources = [
+                    node for node in captured_nodes
+                    if node.metadata.get("window_handle") == target_window_handle
+                    and self._matches_target_fields(
+                        node, name=name, window_name=window_name, control_type=control_type
+                    )
+                ]
+                if len(sources) != 1:
+                    raise ValueError("TARGET_NOT_FOUND: target is not unique in the source Snapshot")
+                source = sources[0]
+            target_window_handle = (
+                captured.active_window.handle
+                if captured.active_window is not None
+                else captured.foreground_root_handle or captured.foreground_handle
+            )
+            if (
+                captured.active_window is not None
+                and captured.active_window.process_id != captured.foreground_process_id
+            ):
+                raise ValueError("STALE_STATE: UIA window does not own the foreground window")
+            if source.metadata.get("window_handle") != target_window_handle:
+                raise ValueError("STALE_STATE: target does not belong to the foreground window")
+
+            fresh = self.tree.get_state(
+                active_window_handle=target_window_handle,
+                other_windows_handles=[],
+                use_dom=bool(captured.active_window and captured.active_window.is_browser),
+            )
+            self.require_snapshot(snapshot_id)
+            if not fresh.status or (fresh.truncated and not source.metadata.get("runtime_id")):
+                raise ValueError("TARGET_NOT_FOUND: fresh UIA tree is incomplete")
+            candidates = list(fresh.interactive_nodes) + list(fresh.scrollable_nodes)
+            matches = [
+                candidate for candidate in candidates
+                if candidate.metadata.get("window_handle") == target_window_handle
+                and self._same_node_identity(source, candidate)
+                and self._matches_target_fields(
+                    candidate, name=name, window_name=window_name, control_type=control_type
+                )
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"TARGET_NOT_FOUND: fresh UIA tree produced {len(matches)} matching elements"
+                )
+            return matches[0].center.x, matches[0].center.y
 
     def get_apps_from_start_menu(self) -> dict[str, str]:
         """Get installed apps. Tries Get-StartApps first, falls back to shortcut scanning."""
@@ -438,6 +860,7 @@ class Desktop:
         window_name, _ = matched_window
         return windows.get(window_name), ""
 
+    @_serialized_gui_call
     def resize_app(
         self, name: str | None = None, size: tuple[int, int] = None, loc: tuple[int, int] = None
     ) -> tuple[str, int]:
@@ -472,6 +895,7 @@ class Desktop:
             window_control.MoveWindow(x, y, width, height)
             return (f"{target_window.name} resized to {width}x{height} at {x},{y}.", 0)
 
+    @_serialized_gui_call
     def app(
         self,
         mode: Literal["launch", "switch", "resize"],
@@ -525,6 +949,7 @@ class Desktop:
         response, status = PowerShellExecutor.execute_command(command)
         return status == 0 and response.strip().lower() == "true"
 
+    @_serialized_gui_call
     def launch_app(self, name: str) -> tuple[str, int, int]:
         apps_map = self.get_apps_from_start_menu()
         matched_app = process.extractOne(name, apps_map.keys(), score_cutoff=70)
@@ -553,6 +978,7 @@ class Desktop:
 
         return response, status, pid
 
+    @_serialized_gui_call
     def switch_app(self, name: str):
         try:
             window, error = self._find_window_by_name(name)
@@ -571,6 +997,7 @@ class Desktop:
         except Exception as e:
             return (f"Error switching app: {str(e)}", 1)
 
+    @_serialized_gui_call
     def bring_window_to_top(self, target_handle: int):
         if not win32gui.IsWindow(target_handle):
             raise ValueError("Invalid window handle")
@@ -649,59 +1076,68 @@ class Desktop:
             logger.exception(f"Failed to bring window to top: {e}")
 
     def get_coordinates_from_label(self, label: int) -> tuple[int, int]:
-        tree_state = self.desktop_state.tree_state
-        if label < len(tree_state.interactive_nodes):
-            element_node = tree_state.interactive_nodes[label]
-        else:
-            scroll_idx = label - len(tree_state.interactive_nodes)
-            if scroll_idx < len(tree_state.scrollable_nodes):
-                element_node = tree_state.scrollable_nodes[scroll_idx]
-            else:
+        with self._get_interaction_lock():
+            if type(label) is not int or label < 0:
                 raise IndexError(f"Label {label} out of range")
-        return element_node.center.x, element_node.center.y
+            tree_state = self.desktop_state.tree_state
+            if label < len(tree_state.interactive_nodes):
+                element_node = tree_state.interactive_nodes[label]
+            else:
+                scroll_idx = label - len(tree_state.interactive_nodes)
+                if scroll_idx < len(tree_state.scrollable_nodes):
+                    element_node = tree_state.scrollable_nodes[scroll_idx]
+                else:
+                    raise IndexError(f"Label {label} out of range")
+            return element_node.center.x, element_node.center.y
 
     def get_coordinates_from_labels(self, labels: list[int]) -> list[tuple[int, int]]:
         """Resolve multiple UI element labels to screen coordinates in bulk."""
-        tree_state = self.desktop_state.tree_state
-        interactive_nodes = tree_state.interactive_nodes
-        scrollable_nodes = tree_state.scrollable_nodes
-        interactive_len = len(interactive_nodes)
+        with self._get_interaction_lock():
+            tree_state = self.desktop_state.tree_state
+            interactive_nodes = tree_state.interactive_nodes
+            scrollable_nodes = tree_state.scrollable_nodes
+            interactive_len = len(interactive_nodes)
 
-        results = []
-        for label in labels:
-            if label < interactive_len:
-                element_node = interactive_nodes[label]
-            else:
-                scroll_idx = label - interactive_len
-                if scroll_idx < len(scrollable_nodes):
-                    element_node = scrollable_nodes[scroll_idx]
-                else:
+            results = []
+            for label in labels:
+                if type(label) is not int or label < 0:
                     raise IndexError(f"Label {label} out of range")
-            results.append((element_node.center.x, element_node.center.y))
-        return results
+                if label < interactive_len:
+                    element_node = interactive_nodes[label]
+                else:
+                    scroll_idx = label - interactive_len
+                    if scroll_idx < len(scrollable_nodes):
+                        element_node = scrollable_nodes[scroll_idx]
+                    else:
+                        raise IndexError(f"Label {label} out of range")
+                results.append((element_node.center.x, element_node.center.y))
+            return results
 
     def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1):
-        if isinstance(loc, list):
-            x, y = loc[0], loc[1]
-        else:
-            x, y = loc
-        if clicks == 0:
-            uia.SetCursorPos(x, y)
-            return
-        match button:
-            case "left":
-                if clicks >= 2:
-                    dbl_wait = uia.GetDoubleClickTime() / 2000.0
-                    for i in range(clicks):
-                        uia.Click(x, y, waitTime=dbl_wait if i < clicks - 1 else 0.5)
-                else:
-                    uia.Click(x, y)
-            case "right":
-                for _ in range(clicks):
-                    uia.RightClick(x, y)
-            case "middle":
-                for _ in range(clicks):
-                    uia.MiddleClick(x, y)
+        with self._get_interaction_lock():
+            if isinstance(loc, list):
+                x, y = loc[0], loc[1]
+            else:
+                x, y = loc
+            if clicks == 0:
+                uia.SetCursorPos(x, y)
+                return
+            match button:
+                case "left":
+                    if clicks >= 2:
+                        dbl_wait = uia.GetDoubleClickTime() / 2000.0
+                        for i in range(clicks):
+                            uia.Click(x, y, waitTime=dbl_wait if i < clicks - 1 else 0.5)
+                    else:
+                        uia.Click(x, y)
+                case "right":
+                    for _ in range(clicks):
+                        uia.RightClick(x, y)
+                case "middle":
+                    for _ in range(clicks):
+                        uia.MiddleClick(x, y)
+                case _:
+                    raise ValueError("button must be left, right, or middle")
 
     # Strings longer than this typed via clipboard paste instead of
     # per-key SendKeys. SendKeys at high cadence loses keystrokes on
@@ -721,28 +1157,29 @@ class Desktop:
         clear: bool | str = False,
         press_enter: bool | str = False,
     ):
-        x, y = loc
-        uia.Click(x, y)
-        if caret_position == "start":
-            uia.SendKeys("{Home}", waitTime=0.05)
-        elif caret_position == "end":
-            uia.SendKeys("{End}", waitTime=0.05)
-        if clear is True or (isinstance(clear, str) and clear.lower() == "true"):
-            sleep(0.5)
-            uia.SendKeys("{Ctrl}a", waitTime=0.05)
-            uia.SendKeys("{Back}", waitTime=0.05)
-        # Per-key SendKeys for short text (so escape sequences keep working);
-        # clipboard paste for long text (so the scan-code queue can't race).
-        has_control_chars = any(c in text for c in ("\n", "\t", "{", "}"))
-        if len(text) >= self._LONG_TEXT_PASTE_THRESHOLD and not has_control_chars:
-            self._paste_text(text)
-        else:
-            escaped_text = _escape_text_for_sendkeys(text)
-            # Bump interval from 0.02 → 0.04. Keeps short-text speed acceptable
-            # while reducing key-loss on slower systems.
-            uia.SendKeys(escaped_text, interval=0.04, waitTime=0.05)
-        if press_enter is True or (isinstance(press_enter, str) and press_enter.lower() == "true"):
-            uia.SendKeys("{Enter}", waitTime=0.05)
+        with self._get_interaction_lock():
+            x, y = loc
+            uia.Click(x, y)
+            if caret_position == "start":
+                uia.SendKeys("{Home}", waitTime=0.05)
+            elif caret_position == "end":
+                uia.SendKeys("{End}", waitTime=0.05)
+            if clear is True or (isinstance(clear, str) and clear.lower() == "true"):
+                sleep(0.5)
+                uia.SendKeys("{Ctrl}a", waitTime=0.05)
+                uia.SendKeys("{Back}", waitTime=0.05)
+            # Per-key SendKeys for short text (so escape sequences keep working);
+            # clipboard paste for long text (so the scan-code queue can't race).
+            has_control_chars = any(c in text for c in ("\n", "\t", "{", "}"))
+            if len(text) >= self._LONG_TEXT_PASTE_THRESHOLD and not has_control_chars:
+                self._paste_text(text)
+            else:
+                escaped_text = _escape_text_for_sendkeys(text)
+                # Bump interval from 0.02 → 0.04. Keeps short-text speed acceptable
+                # while reducing key-loss on slower systems.
+                uia.SendKeys(escaped_text, interval=0.04, waitTime=0.05)
+            if press_enter is True or (isinstance(press_enter, str) and press_enter.lower() == "true"):
+                uia.SendKeys("{Enter}", waitTime=0.05)
 
     def _paste_text(self, text: str):
         """Stash text on the clipboard, Ctrl+V, restore prior clipboard.
@@ -773,34 +1210,43 @@ class Desktop:
         direction: Literal["up", "down", "left", "right"] = "down",
         wheel_times: int = 1,
     ) -> str | None:
-        if loc:
-            self.move(loc)
-        match type:
-            case "vertical":
-                match direction:
-                    case "up":
-                        uia.WheelUp(wheel_times)
-                    case "down":
-                        uia.WheelDown(wheel_times)
-                    case _:
-                        return 'Invalid direction. Use "up" or "down".'
-            case "horizontal":
-                match direction:
-                    case "left":
-                        uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                        uia.WheelUp(wheel_times)
-                        sleep(0.05)
-                        uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                    case "right":
-                        uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                        uia.WheelDown(wheel_times)
-                        sleep(0.05)
-                        uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                    case _:
-                        return 'Invalid direction. Use "left" or "right".'
-            case _:
-                return 'Invalid type. Use "horizontal" or "vertical".'
-        return None
+        with self._get_interaction_lock():
+            if loc:
+                self.move(loc)
+            match type:
+                case "vertical":
+                    match direction:
+                        case "up":
+                            uia.WheelUp(wheel_times)
+                        case "down":
+                            uia.WheelDown(wheel_times)
+                        case _:
+                            raise ValueError(
+                                'direction must be "up" or "down" for vertical scroll'
+                            )
+                case "horizontal":
+                    match direction:
+                        case "left":
+                            try:
+                                uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
+                                uia.WheelUp(wheel_times)
+                                sleep(0.05)
+                            finally:
+                                uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
+                        case "right":
+                            try:
+                                uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
+                                uia.WheelDown(wheel_times)
+                                sleep(0.05)
+                            finally:
+                                uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
+                        case _:
+                            raise ValueError(
+                                'direction must be "left" or "right" for horizontal scroll'
+                            )
+                case _:
+                    raise ValueError('type must be "horizontal" or "vertical"')
+            return None
 
     def _normalize_drag_duration(self, duration: float | int | str | None) -> float | None:
         if duration is None:
@@ -832,55 +1278,68 @@ class Desktop:
         from_loc: tuple[int, int] | list[int] | None = None,
         duration: float | int | str | None = None,
     ) -> dict[str, object]:
-        x, y = self._normalize_drag_point(loc, "loc")
-        normalized_from_loc = (
-            None if from_loc is None else self._normalize_drag_point(from_loc, "from_loc")
-        )
-        effective_duration = self._normalize_drag_duration(duration)
-        sleep(0.5)
-        if normalized_from_loc is None:
-            cx, cy = uia.GetCursorPos()
-        else:
-            cx, cy = normalized_from_loc
-        uia.DragDrop(cx, cy, x, y, moveSpeed=1, duration=effective_duration)
-        return {
-            "start": [cx, cy],
-            "end": [x, y],
-            "duration": effective_duration,
-        }
+        with self._get_interaction_lock():
+            x, y = self._normalize_drag_point(loc, "loc")
+            normalized_from_loc = (
+                None if from_loc is None else self._normalize_drag_point(from_loc, "from_loc")
+            )
+            effective_duration = self._normalize_drag_duration(duration)
+            sleep(0.5)
+            if normalized_from_loc is None:
+                cx, cy = uia.GetCursorPos()
+            else:
+                cx, cy = normalized_from_loc
+            uia.DragDrop(cx, cy, x, y, moveSpeed=1, duration=effective_duration)
+            return {
+                "start": [cx, cy],
+                "end": [x, y],
+                "duration": effective_duration,
+            }
 
     def move(self, loc: tuple[int, int]):
-        x, y = loc
-        uia.MoveTo(x, y, moveSpeed=10)
+        with self._get_interaction_lock():
+            x, y = loc
+            uia.MoveTo(x, y, moveSpeed=10)
 
     def shortcut(self, shortcut: str):
-        keys = shortcut.split("+")
-        sendkeys_str = ""
-        for key in keys:
-            key = key.strip()
-            if len(key) == 1:
-                sendkeys_str += key
-            else:
-                name = _KEY_ALIASES.get(key.lower(), key)
-                sendkeys_str += "{" + name + "}"
-        uia.SendKeys(sendkeys_str, interval=0.01)
+        with self._get_interaction_lock():
+            keys = shortcut.split("+")
+            sendkeys_str = ""
+            for key in keys:
+                key = key.strip()
+                if len(key) == 1:
+                    sendkeys_str += key
+                else:
+                    name = _KEY_ALIASES.get(key.lower(), key)
+                    sendkeys_str += "{" + name + "}"
+            uia.SendKeys(sendkeys_str, interval=0.01)
 
-    def multi_select(self, press_ctrl: bool | str = False, locs: list[tuple[int, int]] = []):
-        press_ctrl = press_ctrl is True or (
-            isinstance(press_ctrl, str) and press_ctrl.lower() == "true"
-        )
-        if press_ctrl:
-            uia.PressKey(uia.Keys.VK_CONTROL, waitTime=0.05)
-        for loc in locs:
-            x, y = loc
-            uia.Click(x, y, waitTime=0.2)
-            sleep(0.5)
-        uia.ReleaseKey(uia.Keys.VK_CONTROL, waitTime=0.05)
+    def multi_select(
+        self,
+        press_ctrl: bool | str = False,
+        locs: list[tuple[int, int]] | None = None,
+    ):
+        with self._get_interaction_lock():
+            locs = locs or []
+            press_ctrl = press_ctrl is True or (
+                isinstance(press_ctrl, str) and press_ctrl.lower() == "true"
+            )
+            try:
+                if press_ctrl:
+                    uia.PressKey(uia.Keys.VK_CONTROL, waitTime=0.05)
+                for loc in locs:
+                    x, y = loc
+                    uia.Click(x, y, waitTime=0.2)
+                    sleep(0.5)
+            finally:
+                if press_ctrl:
+                    uia.ReleaseKey(uia.Keys.VK_CONTROL, waitTime=0.05)
 
     def multi_edit(self, locs: list[tuple[int, int, str]]):
-        for loc in locs:
-            x, y, text = loc
-            self.type((x, y), text=text, clear=True)
+        with self._get_interaction_lock():
+            for loc in locs:
+                x, y, text = loc
+                self.type((x, y), text=text, clear=True)
 
     def scrape(self, url: str) -> str:
         current_url = url

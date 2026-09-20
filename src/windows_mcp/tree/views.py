@@ -22,6 +22,9 @@ def _action_for(control_type: str) -> str:
 
 def _node_meta_str(metadata: dict[str, Any]) -> str:
     parts = []
+    automation_id = metadata.get("automation_id")
+    if automation_id:
+        parts.append(f'id:"{automation_id}"')
     if metadata.get("has_focused"):
         parts.append("focused")
     if metadata.get("is_password"):
