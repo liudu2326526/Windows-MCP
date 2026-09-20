@@ -183,6 +183,8 @@ def build_snapshot_response(
         )
 
     metadata_text = f"Cursor Position: {desktop_state.cursor_position}\n"
+    if desktop_state.snapshot_id:
+        metadata_text += f"Snapshot ID: {desktop_state.snapshot_id}\n"
     if desktop_state.screenshot_original_size:
         orig = desktop_state.screenshot_original_size
         scale = desktop_state.screenshot_scale or 1.0

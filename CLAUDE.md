@@ -4,16 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Windows-MCP is a Python MCP (Model Context Protocol) server that bridges AI LLM agents with the Windows OS, enabling direct desktop automation. It exposes 20 tools via FastMCP:
+Windows-MCP is a Python MCP (Model Context Protocol) server that bridges AI LLM agents with the Windows OS, enabling direct desktop automation. It exposes 22 tools via FastMCP:
 
 | Group | Tools |
 |---|---|
 | Capture | `Screenshot`, `Snapshot`, `Scrape`, `DisplayInventory` |
-| Input | `Click`, `Type`, `Scroll`, `Move` (also drag-and-drop via `drag=True`), `Shortcut`, `MultiSelect`, `MultiEdit` |
-| Timing | `Wait`, `WaitFor` |
+| Input | `Click`, `Type`, `Scroll`, `Move` (also drag-and-drop via `drag=True`), `Shortcut`, `MultiSelect`, `MultiEdit`, `RunBatch` |
+| Timing | `Wait`, `WaitFor`, `CancelBatch` |
 | System | `App`, `PowerShell`, `FileSystem`, `Registry`, `Process`, `Clipboard`, `Notification` |
 
-Tool names are defined by the `name=` argument of each `@mcp.tool(...)` in `src/windows_mcp/tools/`; that directory is the source of truth. Note the shell tool is registered as `PowerShell`, not `Shell`. Any subset can be removed at startup with `--disable-tools` (e.g. `--disable-tools PowerShell,Registry`).
+Tool names are defined by the `name=` argument of each `@mcp.tool(...)` in `src/windows_mcp/tools/`; that directory is the source of truth. Note the shell tool is registered as `PowerShell`, not `Shell`. Any subset can be enabled at startup with `--tools`, or removed with `--exclude-tools` (for example, `--tools Screenshot,Snapshot,RunBatch,CancelBatch` or `--exclude-tools PowerShell,Registry`).
 
 ## Build & Development Commands
 
@@ -27,7 +27,7 @@ pytest                     # Run all tests
 pytest tests/test_foo.py   # Run a single test file
 ```
 
-**Package manager**: UV (not pip). **Python**: 3.13+. **Build backend**: Hatchling.
+**Package manager**: UV (not pip). **Python**: 3.14+ (see `pyproject.toml` and `.python-version`). **Build backend**: setuptools.
 
 ## Architecture
 
@@ -38,6 +38,8 @@ The codebase follows a layered service architecture under `src/windows_mcp/`:
 **Tools layer** — `tools/`: One module per tool group, each exposing `register(mcp, *, get_desktop, get_analytics)`. `tools/__init__.py` holds the module list and `register_all()`. Tool functions are thin — they normalize arguments and delegate to a service package. The `@with_analytics` decorator wraps each one for telemetry, making it the existing precedent for cross-cutting concerns at the tool boundary.
 
 **Desktop service** — `desktop/service.py`: High-level orchestrator. Manages window operations (launch, resize, switch), screenshots, mouse/keyboard actions, and clipboard. Interfaces with Tree service for UI element discovery. `desktop/views.py` defines data models: `DesktopState`, `Window`, `Size`, `BoundingBox`, `Status`.
+
+**Batch execution** — `tools/batch.py`: `RunBatch` validates action-specific schemas, resolves Snapshot-bound targets, executes serial input steps, and evaluates local waits and verification predicates. `CancelBatch` requests cooperative cancellation by `execution_id`. Native calls already in progress cannot be forcibly interrupted, and batches do not roll back. The Chinese [implementation and acceptance guide](docs/low-latency-computer-use.zh.md) describes the supported interface and remaining integration work.
 
 **Tree service** — `tree/service.py`: Captures the Windows accessibility tree from active and background windows. Identifies interactive elements and scrollable areas. Uses `ThreadPoolExecutor` for multi-threaded UI traversal. `tree/views.py` defines `TreeElementNode`, `ScrollElementNode`, `TreeState`. `tree/config.py` has control type configurations.
 
@@ -85,4 +87,4 @@ The codebase follows a layered service architecture under `src/windows_mcp/`:
 
 ## Security Context
 
-This server has **full system access** with no sandboxing. `PowerShell`, `FileSystem`, `Registry`, `Process`, and `App` can all perform irreversible operations, and there is no audit log or rollback. The recommended deployment target is a VM or Windows Sandbox. Use `--disable-tools` to drop the tools a given deployment does not need.
+This server has **full system access** with no sandboxing. `PowerShell`, `FileSystem`, `Registry`, `Process`, and `App` can all perform irreversible operations, and there is no durable audit log or rollback. The recommended deployment target is a VM or Windows Sandbox. Use `--tools` or `--exclude-tools` to drop the tools a given deployment does not need. `RunBatch` accepts UI actions and waits; it excludes direct shell, registry, filesystem, process, application-launch, and nested-batch actions. GUI clicks and keyboard input can still submit forms, delete data, or open terminals. The calling application owns authorization and must split batches before actions that need separate approval.

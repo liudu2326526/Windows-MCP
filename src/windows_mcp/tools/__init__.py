@@ -2,6 +2,7 @@
 
 from windows_mcp.tools import (
     app,
+    batch,
     clipboard,
     display,
     filesystem,
@@ -17,6 +18,7 @@ from windows_mcp.tools import (
 
 _MODULES = [
     app,
+    batch,
     display,
     shell,
     filesystem,
