@@ -12,10 +12,11 @@
 | 独立观察 | 保留 `Snapshot` / `Screenshot`，Snapshot 返回 `Snapshot ID` |
 | 短动作组 | `RunBatch`，1–32 个步骤，默认总预算 30 秒，上限 120 秒 |
 | 快照引用 | ID 包含服务实例随机标识与代数；保存有限历史，重启后旧 ID 失效 |
-| 前台校验 | 输入前比较当前真实 HWND/PID 与引用快照；可附加进程或窗口约束 |
+| 前台校验 | 输入前比较当前 raw HWND、UIA 根 HWND、PID 与引用快照；窗口标题和进程约束读取实时值 |
 | UIA 重新定位 | label 从其原快照恢复目标身份，再从新 UIA 树中唯一匹配；名称也从新树匹配 |
-| 条件等待与验证 | 每步可包含 `wait_for` 和 `verify`，在服务器内部执行 |
+| 条件等待与验证 | 每步可包含 `wait_for` 和 `verify`，在服务器内部执行；`element_enabled` 要求 UIA 明确返回 enabled |
 | 取消 | `CancelBatch` 按调用方提供的 `execution_id` 发出协作取消请求 |
+| 并发和 COM | 需要桌面观察或输入的批次独占桌面交互锁；基础 UIA client 按线程保存，RunBatch 不跨线程复用其 COM 指针 |
 | 结果记录 | 返回步骤结果、错误码、耗时和前台身份摘要；没有自动回滚 |
 | UIA 语义输入 | 尚未提供 `Invoke` / `ValuePattern.SetValue` 等动作；输入仍走鼠标、键盘或剪贴板 |
 | DSH / PADS / 权限产品化 | 提供接入建议；本 fork 不实现 DSH Agent Loop、审批产品或 PADS 业务对象 API |
@@ -130,7 +131,7 @@ App（可选）
 
 该例检查输入框中的值，不证明已保存到磁盘或服务器。需要保存时，在宿主完成相应授权后发送单独的保存步骤，并验证应用给出的保存状态；不要仅以按下快捷键或点击按钮作为成功依据。
 
-`window` 可以包含 `title_contains`、精确匹配的 `process_name`、`process_id`，多个条件共同生效。引用快照的 HWND/PID 校验始终执行；这些字段是额外约束。
+`window` 可以包含 `title_contains`、精确匹配的 `process_name`、`process_id`，多个条件共同生效。引用 UIA 快照时校验 raw HWND、UIA 根 HWND 和 PID；`Screenshot` 或 `use_ui_tree=false` 的快照仅校验 raw HWND 和 PID。窗口约束是额外检查，并在每次检查时从当前前台窗口重新读取，不使用快照中保存的旧标题或进程名。
 
 ### 3.2 label、坐标和批量字段
 
@@ -237,7 +238,7 @@ RunBatch 返回 FastMCP `ToolResult`：`structuredContent` 提供结构化结果
 
 默认 `stop_on_error=true`。即使设为 false，超时、取消和快照失效也会停止后续步骤。`final_observation` 是快照元数据加实时 HWND/PID 摘要，不是完整动作后 UIA 树或业务结果；需要恢复现场时调用 Snapshot。
 
-同一前台桌面不支持多个 Agent 并行输入。服务端的锁串行化受保护的原生观察/输入操作，但不能阻止用户、其他进程或远程桌面软件改变 UI；原生调用前后仍存在系统事件竞争窗口。前台校验和重定位降低误操作风险，不能当成应用隔离或安全沙箱。
+同一前台桌面不支持多个 Agent 并行输入。包含输入、条件等待、验证或显式快照引用的 RunBatch 从起始观察到批次结束持有桌面交互锁，普通输入工具使用同一把锁；等待该锁仍受批次取消和总 timeout 约束。仅包含时长等待且未引用快照的批次不占用桌面锁。`CancelBatch` 只访问取消注册表，不需要桌面锁。服务端锁不能阻止用户、其他进程或远程桌面软件改变 UI；前台身份会在采集过程多次读取，并在原生输入前复核，但系统事件仍可能发生在相邻检查之间。前台校验和重定位降低误操作风险，不能当成应用隔离或安全沙箱。
 
 ## 5. DSH 和策略层接入
 
@@ -254,8 +255,8 @@ DSH 可先通过已有 MCP 客户端消费本 fork，不需要修改 Agent Loop�
 ```powershell
 uv sync --frozen --extra dev
 uv run --frozen --extra dev python -m compileall -q src tests
-uv run --frozen --extra dev ruff check src/windows_mcp/tools/batch.py src/windows_mcp/desktop/service.py src/windows_mcp/desktop/views.py src/windows_mcp/tools/_snapshot_helpers.py tests/test_batch_tool.py tests/test_stdio_handshake.py
-uv run --frozen --extra dev pytest -q tests/test_batch_tool.py tests/test_wait_for_tool.py tests/test_multi_tools.py tests/test_stdio_handshake.py
+uv run --frozen --extra dev ruff check src/windows_mcp/tools/batch.py src/windows_mcp/tools/input.py src/windows_mcp/desktop/service.py src/windows_mcp/desktop/views.py src/windows_mcp/tree/service.py src/windows_mcp/uia/core.py src/windows_mcp/tools/_snapshot_helpers.py tests/test_batch_tool.py tests/test_snapshot_identity.py tests/test_uia_thread_affinity.py tests/test_wait_for_tool.py tests/test_stdio_handshake.py
+uv run --frozen --extra dev pytest -q tests/test_batch_tool.py tests/test_snapshot_identity.py tests/test_uia_thread_affinity.py tests/test_wait_for_tool.py tests/test_multi_tools.py tests/test_stdio_handshake.py
 git diff --check
 ```
 

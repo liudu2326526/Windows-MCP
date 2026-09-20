@@ -50,14 +50,16 @@ from .comtypes_cache import safe_get_module  # noqa: E402
 
 
 class _AutomationClient:
-    _instance = None
+    _thread_local = threading.local()
 
     @classmethod
     def instance(cls) -> "_AutomationClient":
-        """Singleton instance (this prevents com creation on import)."""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        """Return the UI Automation client owned by the current COM apartment."""
+        instance = getattr(cls._thread_local, "instance", None)
+        if instance is None:
+            instance = cls()
+            cls._thread_local.instance = instance
+        return instance
 
     def __init__(self):
         try:
@@ -2634,9 +2636,9 @@ def _get_automation3():
     """
     Get an `IUIAutomation3` object, for the TextEdit-changed handlers below.
 
-    Naively QueryInterface-ing the shared `_AutomationClient.instance().IUIAutomation`
-    singleton up to `IUIAutomation3` does NOT work -- verified live: that singleton is created
-    from the `CUIAutomation` coclass (CLSID `{ff48dba4-...}`), which only ever implements
+    QueryInterface on `_AutomationClient.instance().IUIAutomation` cannot return
+    `IUIAutomation3`: the base client is created from the `CUIAutomation` coclass
+    (CLSID `{ff48dba4-...}`), which only implements
     plain `IUIAutomation`; `QueryInterface(IUIAutomation2/3/.../6)` on it fails with
     E_NOINTERFACE regardless of Windows version. The whole newer interface ladder
     (IUIAutomation2 through IUIAutomation6) is only reachable through the separate

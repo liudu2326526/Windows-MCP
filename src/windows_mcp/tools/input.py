@@ -151,8 +151,13 @@ def _matches_wait_condition(
 
     if condition in {"element_exists", "element_enabled"}:
         for node in _iter_nodes(desktop_state):
-            if _node_matches(node, text, window_name):
-                return True, f"element matched {getattr(node, 'name', '')!r}"
+            if not _node_matches(node, text, window_name):
+                continue
+            if condition == "element_enabled":
+                metadata = getattr(node, "metadata", {})
+                if metadata.get("is_enabled") is not True:
+                    continue
+            return True, f"element matched {getattr(node, 'name', '')!r}"
         return False, "matching element was absent"
 
     if condition == "focused_element":

@@ -295,8 +295,8 @@ class Tree:
         ):
             try:
                 value = getattr(node, attribute)
-                if isinstance(value, bool):
-                    metadata[key] = value
+                if type(value) in (bool, int) and value in (0, 1):
+                    metadata[key] = bool(value)
             except Exception:
                 pass
         return metadata

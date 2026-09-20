@@ -15,8 +15,16 @@ from typing import Annotated, Any, Callable, Literal
 from fastmcp import Context
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from psutil import Process
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    GetPydanticSchema,
+    StrictInt,
+    TypeAdapter,
+    model_validator,
+)
+from pydantic_core import core_schema
 
 from windows_mcp.infrastructure import with_analytics
 from windows_mcp.tools.input import _matches_wait_condition, _validate_wait_for_args
@@ -237,6 +245,23 @@ BatchStep = Annotated[
 ]
 
 _STEPS_ADAPTER = TypeAdapter(list[BatchStep])
+
+
+def _accept_raw_steps(value: Any) -> Any:
+    return value
+
+
+def _raw_steps_schema(_source_type: Any, handler: Any) -> Any:
+    return core_schema.no_info_plain_validator_function(
+        _accept_raw_steps,
+        json_schema_input_schema=handler.generate_schema(list[BatchStep] | str),
+    )
+
+
+RawSteps = Annotated[
+    Any,
+    GetPydanticSchema(_raw_steps_schema),
+]
 _CANCEL_LOCK = threading.Lock()
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
 
@@ -284,6 +309,19 @@ def _check_cancelled(cancel_event: threading.Event) -> None:
         raise BatchCancelledError("RunBatch was cancelled")
 
 
+def _acquire_interaction_lease(
+    lock: threading.RLock,
+    deadline: float,
+    cancel_event: threading.Event,
+) -> None:
+    """Acquire the desktop lease while preserving timeout and cancellation checks."""
+    while True:
+        _check_cancelled(cancel_event)
+        remaining = _remaining(deadline)
+        if lock.acquire(timeout=min(remaining, 0.1)):
+            return
+
+
 def _sleep_interruptibly(
     duration: float,
     deadline: float,
@@ -317,29 +355,31 @@ def _error_code(error: BaseException) -> str:
     return "ACTION_FAILED"
 
 
-def _check_window_constraint(state: Any, constraint: WindowConstraint | None) -> None:
+def _check_window_constraint(desktop: Any, constraint: WindowConstraint | None) -> None:
     if constraint is None:
         return
-    active = getattr(state, "active_window", None)
-    if active is None:
-        raise ValueError("TARGET_NOT_FOUND: Snapshot has no active window")
+    reader = getattr(desktop, "get_foreground_window_identity", None)
+    if reader is None:
+        raise ValueError("TARGET_NOT_FOUND: desktop runtime cannot inspect the active window")
+    try:
+        active = reader()
+    except Exception as exc:
+        raise ValueError("STALE_STATE: active window identity is unavailable") from exc
     if constraint.title_contains is not None:
-        if constraint.title_contains.casefold() not in active.name.casefold():
-            raise ValueError(f"TARGET_MISMATCH: active window is {active.name!r}")
+        if constraint.title_contains.casefold() not in active.title.casefold():
+            raise ValueError("TARGET_MISMATCH: active window title does not match")
     if constraint.process_id is not None and constraint.process_id != active.process_id:
         raise ValueError("TARGET_MISMATCH: active process id does not match")
     if constraint.process_name is not None:
-        try:
-            actual_name = Process(active.process_id).name()
-        except Exception as exc:
-            raise ValueError("TARGET_MISMATCH: active process name is unavailable") from exc
-        if constraint.process_name.casefold() != actual_name.casefold():
+        if active.process_name is None:
+            raise ValueError("TARGET_MISMATCH: active process name is unavailable")
+        if constraint.process_name.casefold() != active.process_name.casefold():
             raise ValueError("TARGET_MISMATCH: active process name does not match")
 
 
 def _require_snapshot(desktop: Any, snapshot_id: str, window: WindowConstraint | None) -> Any:
     state = desktop.require_snapshot(snapshot_id)
-    _check_window_constraint(state, window)
+    _check_window_constraint(desktop, window)
     return state
 
 
@@ -350,8 +390,9 @@ def _resolve_target(
     window: WindowConstraint | None,
 ) -> list[int]:
     target_snapshot_id = target.snapshot_id or snapshot_id
-    _require_snapshot(desktop, target_snapshot_id, window)
     if target.loc is not None:
+        if target_snapshot_id != snapshot_id:
+            _require_snapshot(desktop, target_snapshot_id, window)
         return list(target.loc)
     resolver = getattr(desktop, "resolve_snapshot_target", None)
     if resolver is None:
@@ -475,7 +516,6 @@ def _execute_input_action(
     with guard:
         _check_cancelled(cancel_event)
         _remaining(deadline)
-        _require_snapshot(desktop, snapshot_id, window)
         def invoke(method, *positional, **keyword):
             _check_cancelled(cancel_event)
             _remaining(deadline)
@@ -584,7 +624,7 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
     """Register bounded batch execution and cooperative cancellation tools."""
 
     def execute_batch(
-        steps: list[BatchStep] | str,
+        steps: object,
         snapshot_id: str | None,
         window: WindowConstraint | None,
         execution_id: str,
@@ -615,7 +655,7 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
     )
     @with_analytics(get_analytics(), "RunBatch-Tool")
     async def run_batch(
-        steps: list[BatchStep] | str,
+        steps: RawSteps,
         snapshot_id: str | None = None,
         window: WindowConstraint | None = None,
         execution_id: str | None = None,
@@ -635,7 +675,7 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
             raise
 
     def run_batch_sync(
-        steps: list[BatchStep] | str,
+        steps: object,
         snapshot_id: str | None,
         window: WindowConstraint | None,
         run_id: str,
@@ -689,12 +729,22 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
         verified_steps = 0
         pins: list[str] = []
         desktop = None
+        interaction_lease = None
+        interaction_lease_acquired = False
         try:
             try:
                 desktop = get_desktop()
                 has_input = any(
                     step.action != "wait" or step.verify is not None for step in parsed_steps
                 )
+                needs_desktop = has_input or snapshot_id is not None or any(
+                    step.wait_for is not None for step in parsed_steps
+                )
+                if needs_desktop:
+                    interaction_lease = getattr(desktop, "interaction_lock", None)
+                    if interaction_lease is not None:
+                        _acquire_interaction_lease(interaction_lease, deadline, cancel_event)
+                        interaction_lease_acquired = True
                 if has_input and snapshot_id is None:
                     state = desktop.get_state(
                         use_vision=False,
@@ -706,14 +756,13 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
                 if has_input and not snapshot_id:
                     raise ValueError("STALE_STATE: RunBatch could not establish a Snapshot")
                 if snapshot_id is not None:
-                    _require_snapshot(desktop, snapshot_id, window)
                     source_ids = {snapshot_id} | {
                         target.snapshot_id for target in targets if target.snapshot_id
                     }
                     for source_id in source_ids:
-                        _require_snapshot(desktop, source_id, window)
                         desktop.pin_snapshot(source_id)
                         pins.append(source_id)
+                    _check_window_constraint(desktop, window)
             except Exception as exc:
                 payload = _failure_payload(
                     execution_id=run_id,
@@ -845,6 +894,8 @@ def register(mcp: Any, *, get_desktop: Callable[[], Any], get_analytics: Callabl
             if desktop is not None:
                 for source_id in pins:
                     desktop.unpin_snapshot(source_id)
+            if interaction_lease is not None and interaction_lease_acquired:
+                interaction_lease.release()
             with _CANCEL_LOCK:
                 _CANCEL_EVENTS.pop(run_id, None)
 

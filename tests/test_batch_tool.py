@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import importlib
 import importlib.util
 import inspect
@@ -68,6 +68,7 @@ class FakeDesktop:
         self.calls = []
         self.resolutions = []
         self.foreground = (10, 20)
+        self.live_title = "Settings"
         self.after_input = None
         self.on_observe = None
         self.input_started = threading.Event()
@@ -105,6 +106,16 @@ class FakeDesktop:
 
     def get_foreground_identity(self):
         return self.foreground
+
+    def get_foreground_window_identity(self):
+        handle, process_id = self.foreground
+        return SimpleNamespace(
+            raw_handle=handle,
+            root_handle=handle,
+            process_id=process_id,
+            title=self.live_title,
+            process_name="settings.exe",
+        )
 
     def require_snapshot(self, snapshot_id):
         state = self.snapshots.get(snapshot_id)
@@ -298,6 +309,23 @@ async def test_foreground_switch_prevents_later_input_even_when_stop_is_false(ba
 
 
 @pytest.mark.asyncio
+async def test_live_title_constraint_rejects_changed_document_with_same_hwnd_pid(batch, desktop):
+    desktop.live_title = "Other document"
+
+    result = await call(
+        tools(batch, desktop)["RunBatch"],
+        steps=[click()],
+        snapshot_id="snap-1",
+        window={"title_contains": "Settings"},
+    )
+
+    data = payload(result)
+    assert data["status"] == "failed"
+    assert data["error_code"] == "TARGET_MISMATCH"
+    assert desktop.calls == []
+
+
+@pytest.mark.asyncio
 async def test_wait_observation_does_not_rebind_existing_labels(batch, desktop):
     original = desktop.desktop_state
     replacement = replace(original.tree_state.interactive_nodes[0], name="Other", center=Center(80, 90))
@@ -421,6 +449,149 @@ async def test_cancel_wakes_wait_and_cleans_execution_registry(batch, desktop):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_batches_cannot_interleave_input_steps(batch, desktop):
+    registered = tools(batch, desktop)
+    first_input = threading.Event()
+    release_first = threading.Event()
+
+    def pause_after_first_input(_):
+        if len(desktop.calls) == 1:
+            first_input.set()
+            assert release_first.wait(2)
+
+    desktop.after_input = pause_after_first_input
+    first = asyncio.create_task(
+        call(
+            registered["RunBatch"],
+            steps=[click(), shortcut()],
+            snapshot_id="snap-1",
+            execution_id="first-batch",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(first_input.wait, 2)
+        second = asyncio.create_task(
+            call(
+                registered["RunBatch"],
+                steps=[click()],
+                snapshot_id="snap-1",
+                execution_id="second-batch",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert desktop.calls == [("click", [1, 2])]
+    finally:
+        release_first.set()
+
+    first_result, second_result = await asyncio.gather(first, second)
+    assert payload(first_result)["status"] == "completed"
+    assert payload(second_result)["status"] == "completed"
+    assert desktop.calls == [("click", [1, 2]), ("shortcut", "ctrl+s"), ("click", [1, 2])]
+
+
+@pytest.mark.asyncio
+async def test_batch_timeout_while_waiting_for_desktop_lease_does_not_release_it(batch, desktop):
+    class UnavailableLock:
+        def __init__(self):
+            self.release_called = False
+
+        def acquire(self, *, timeout):
+            return False
+
+        def release(self):
+            self.release_called = True
+            raise AssertionError("an unacquired lease must not be released")
+
+    lock = UnavailableLock()
+    desktop.interaction_lock = lock
+
+    result = await call(
+        tools(batch, desktop)["RunBatch"],
+        steps=[click()],
+        snapshot_id="snap-1",
+        timeout=0.001,
+    )
+
+    assert payload(result)["error_code"] == "TIMEOUT"
+    assert lock.release_called is False
+    assert desktop.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uses_snapshot", [False, True])
+async def test_observation_only_batch_timeout_includes_desktop_lease_wait(
+    batch, desktop, uses_snapshot
+):
+    step = {"action": "wait", "args": {"duration": 0}}
+    if not uses_snapshot:
+        step["wait_for"] = {"condition": "active_window", "text": "Settings"}
+    desktop.interaction_lock.acquire()
+    try:
+        result = await asyncio.wait_for(
+            call(
+                tools(batch, desktop)["RunBatch"],
+                steps=[step],
+                snapshot_id="snap-1" if uses_snapshot else None,
+                timeout=0.01,
+            ),
+            timeout=2,
+        )
+    finally:
+        desktop.interaction_lock.release()
+
+    assert payload(result)["error_code"] == "TIMEOUT"
+    assert desktop.calls == []
+    assert desktop.pins == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uses_snapshot", [False, True])
+async def test_observation_only_batch_can_cancel_while_waiting_for_desktop_lease(
+    batch, desktop, uses_snapshot
+):
+    class BusyLease:
+        def __init__(self):
+            self.attempted = threading.Event()
+            self.never_acquired = threading.Event()
+
+        def acquire(self, *, timeout):
+            self.attempted.set()
+            return self.never_acquired.wait(timeout)
+
+        def release(self):
+            raise AssertionError("an unacquired lease must not be released")
+
+    lease = BusyLease()
+    desktop.interaction_lock = lease
+    registered = tools(batch, desktop)
+    step = {"action": "wait", "args": {"duration": 0}}
+    if not uses_snapshot:
+        step["wait_for"] = {"condition": "active_window", "text": "Settings"}
+    task = asyncio.create_task(
+        call(
+            registered["RunBatch"],
+            steps=[step],
+            snapshot_id="snap-1" if uses_snapshot else None,
+            execution_id="observation-waiter",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(lease.attempted.wait, 2)
+        cancellation = await call(registered["CancelBatch"], execution_id="observation-waiter")
+        assert payload(cancellation)["status"] == "cancellation_requested"
+        result = await asyncio.wait_for(task, 2)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
+
+    assert payload(result)["error_code"] == "CANCELLED"
+    assert desktop.calls == []
+    assert desktop.pins == set()
+    assert "observation-waiter" not in batch._CANCEL_EVENTS
+
+
+@pytest.mark.asyncio
 async def test_wait_only_batch_has_no_completed_input_actions(batch, desktop):
     result = await call(tools(batch, desktop)["RunBatch"], steps=[{"action": "wait", "args": {"duration": 0}}])
     assert payload(result)["completed_actions"] == 0
@@ -455,6 +626,37 @@ async def test_wire_schema_exposes_action_variants_and_hides_context(server):
     for field in ("click", "shortcut", "multi_edit", "target", "text", "wait_for", "verify"):
         assert field in text
     assert "execution_id" in definitions["CancelBatch"].input_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_wire_validation_does_not_disclose_typed_text(server, desktop, caplog):
+    secret = "typed-secret-777"
+    caplog.set_level("DEBUG")
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "RunBatch",
+            {
+                "steps": [
+                    {
+                        "action": "type",
+                        "args": {
+                            "target": {"loc": [1, 2]},
+                            "text": secret,
+                            "unexpected": 1,
+                        },
+                    }
+                ]
+            },
+            raise_on_error=False,
+        )
+
+    serialized_result = json.dumps(asdict(result), default=str)
+    serialized_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert result.is_error
+    assert secret not in serialized_result
+    assert secret not in serialized_logs
+    assert desktop.calls == []
 
 
 @pytest.mark.asyncio

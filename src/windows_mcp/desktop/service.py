@@ -8,7 +8,15 @@ from windows_mcp.vdm.core import (
     get_current_desktop,
     is_window_on_current_desktop,
 )
-from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
+from windows_mcp.desktop.views import (
+    Browser,
+    DesktopState,
+    Display,
+    ForegroundWindowIdentity,
+    Size,
+    Status,
+    Window,
+)
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
 from PIL import ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
@@ -186,6 +194,34 @@ class Desktop:
             raise ValueError("STALE_STATE: foreground window has no owning process")
         return handle, process_id
 
+    def get_foreground_window_identity(self) -> ForegroundWindowIdentity:
+        """Return live raw, UIA-root, process, and title identity for the foreground window."""
+        raw_before = self.get_foreground_identity()
+        root = self.get_window_from_element_handle(raw_before[0])
+        root_handle = root.NativeWindowHandle
+        root_process_id = root.ProcessId
+        title = root.Name
+        raw_after = self.get_foreground_identity()
+        if raw_after != raw_before:
+            raise ValueError("STALE_STATE: foreground window changed while reading its UIA root")
+        if type(root_handle) is not int or root_handle <= 0 or not win32gui.IsWindow(root_handle):
+            raise ValueError("STALE_STATE: foreground UIA root has no valid window")
+        if type(root_process_id) is not int or root_process_id != raw_before[1]:
+            raise ValueError("STALE_STATE: foreground UIA root belongs to another process")
+        try:
+            process_name = Process(root_process_id).name()
+        except Exception:
+            process_name = None
+        if self.get_foreground_identity() != raw_before:
+            raise ValueError("STALE_STATE: foreground window changed while reading process identity")
+        return ForegroundWindowIdentity(
+            raw_handle=raw_before[0],
+            root_handle=root_handle,
+            process_id=root_process_id,
+            title=title if isinstance(title, str) else "",
+            process_name=process_name,
+        )
+
     def _capture_foreground_identity(self) -> tuple[int, int] | None:
         """Allow observation during focus transitions without granting input authority."""
         try:
@@ -193,6 +229,41 @@ class Desktop:
         except Exception:
             # Win32 can lose the foreground HWND between either identity query.
             return None
+
+    def _capture_foreground_window_identity(self) -> ForegroundWindowIdentity | None:
+        """Observe a complete foreground identity without making a Snapshot actionable."""
+        try:
+            return self.get_foreground_window_identity()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _stable_snapshot_identity(
+        observations: list[ForegroundWindowIdentity | None],
+        *,
+        uia_root_handle: int | None,
+        uia_root_process_id: int | None,
+        require_uia_root: bool = False,
+    ) -> ForegroundWindowIdentity | None:
+        """Accept an identity only when every checkpoint and the captured UIA root agree."""
+        if not observations or any(identity is None for identity in observations):
+            return None
+        if require_uia_root and (uia_root_handle is None or uia_root_process_id is None):
+            return None
+        first = observations[0]
+        assert first is not None
+        identity_key = (first.raw_handle, first.root_handle, first.process_id)
+        if any(
+            (identity.raw_handle, identity.root_handle, identity.process_id) != identity_key
+            for identity in observations[1:]
+            if identity is not None
+        ):
+            return None
+        if uia_root_handle is not None and uia_root_handle != first.root_handle:
+            return None
+        if uia_root_process_id is not None and uia_root_process_id != first.process_id:
+            return None
+        return first
 
     def get_state(
         self,
@@ -235,7 +306,6 @@ class Desktop:
         region: list[int] | tuple[int, ...] | None = None,
         max_image_size: Size | None = None,
     ) -> DesktopState:
-        foreground_before = self._capture_foreground_identity()
         use_annotation = use_annotation is True or (
             isinstance(use_annotation, str) and use_annotation.lower() == "true"
         )
@@ -250,6 +320,13 @@ class Desktop:
 
         if use_dom and not use_ui_tree:
             raise ValueError("use_dom=True requires use_ui_tree=True")
+
+        foreground_observations: list[ForegroundWindowIdentity | None] = []
+        foreground_raw_before: tuple[int, int] | None = None
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
+        else:
+            foreground_raw_before = self._capture_foreground_identity()
 
         start_time = time()
         profile_enabled = _snapshot_profile_enabled()
@@ -287,6 +364,9 @@ class Desktop:
             windows_handles = set()
             active_window = None
             active_window_handle = None
+
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
 
         cursor_position = self.get_cursor_location()
 
@@ -330,6 +410,10 @@ class Desktop:
             tree_state = self.tree.get_state(
                 tree_active_window_handle, list(other_windows_handles), use_dom=use_dom
             )
+            captured_uia_root_handle = tree_active_window_handle
+            captured_uia_root_process_id = (
+                active_window.process_id if tree_active_window_handle and active_window else None
+            )
         else:
             root_box = screenshot_region or self.tree.screen_box
             tree_state = TreeState(
@@ -343,6 +427,11 @@ class Desktop:
                     metadata={},
                 ),
             )
+            captured_uia_root_handle = None
+            captured_uia_root_process_id = None
+
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
 
         if profile_enabled:
             tree_capture_ms = (perf_counter() - stage_started_at) * 1000
@@ -412,9 +501,20 @@ class Desktop:
         else:
             screenshot = None
 
-        foreground_after = self._capture_foreground_identity()
-        if foreground_after != foreground_before:
-            foreground_after = None
+        foreground = None
+        foreground_raw = None
+        if use_ui_tree:
+            foreground_observations.append(self._capture_foreground_window_identity())
+            foreground = self._stable_snapshot_identity(
+                foreground_observations,
+                uia_root_handle=captured_uia_root_handle,
+                uia_root_process_id=captured_uia_root_process_id,
+                require_uia_root=True,
+            )
+        else:
+            foreground_raw_after = self._capture_foreground_identity()
+            if foreground_raw_after == foreground_raw_before:
+                foreground_raw = foreground_raw_after
 
         self.desktop_state = DesktopState(
             active_window=active_window,
@@ -434,8 +534,17 @@ class Desktop:
             else None,
             capture_sec=time() - start_time,
             snapshot_id=self._next_snapshot_id(),
-            foreground_handle=foreground_after[0] if foreground_after else None,
-            foreground_process_id=foreground_after[1] if foreground_after else None,
+            foreground_handle=(
+                foreground.raw_handle
+                if foreground
+                else (foreground_raw[0] if foreground_raw else None)
+            ),
+            foreground_root_handle=foreground.root_handle if foreground else None,
+            foreground_process_id=(
+                foreground.process_id
+                if foreground
+                else (foreground_raw[1] if foreground_raw else None)
+            ),
         )
         self._remember_snapshot(self.desktop_state)
         if profile_enabled:
@@ -489,12 +598,20 @@ class Desktop:
             if not state.foreground_handle or not state.foreground_process_id:
                 raise ValueError("STALE_STATE: Snapshot has no stable foreground identity")
             try:
-                current_handle, current_pid = self.get_foreground_identity()
+                if state.foreground_root_handle:
+                    current = self.get_foreground_window_identity()
+                    current_handle = current.raw_handle
+                    current_root_handle = current.root_handle
+                    current_process_id = current.process_id
+                else:
+                    current_handle, current_process_id = self.get_foreground_identity()
+                    current_root_handle = None
             except Exception as exc:
                 raise ValueError("STALE_STATE: foreground identity is unavailable") from exc
             if (
                 state.foreground_handle != current_handle
-                or state.foreground_process_id != current_pid
+                or state.foreground_root_handle != current_root_handle
+                or state.foreground_process_id != current_process_id
             ):
                 raise ValueError(
                     "STALE_STATE: foreground window changed after the referenced Snapshot"
@@ -581,7 +698,7 @@ class Desktop:
                 target_window_handle = (
                     captured.active_window.handle
                     if captured.active_window is not None
-                    else captured.foreground_handle
+                    else captured.foreground_root_handle or captured.foreground_handle
                 )
                 sources = [
                     node for node in captured_nodes
@@ -596,7 +713,7 @@ class Desktop:
             target_window_handle = (
                 captured.active_window.handle
                 if captured.active_window is not None
-                else captured.foreground_handle
+                else captured.foreground_root_handle or captured.foreground_handle
             )
             if (
                 captured.active_window is not None
